@@ -19,105 +19,142 @@
 package io.redpanda.examples;
 
 
-import org.apache.flink.api.common.functions.FlatMapFunction;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.util.Collector;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
+import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcSink;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
-import org.apache.flink.connector.kafka.sink.KafkaSink;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * This is a re-write of the Apache Flink WordCount example using Kafka connectors.
- * Find the original example at 
- * https://github.com/apache/flink/blob/master/flink-examples/flink-examples-streaming/src/main/java/org/apache/flink/streaming/examples/wordcount/WordCount.java
- */
+import java.util.UUID;
+
+
 public class WordCount {
 
-	final static String inputTopic = "input-topic";
-	final static String outputTopic = "output-topic";
-	final static String jobTitle = "WordCount";
+    //    final static String inputTopic = "soso";
+//    final static String inputTopic = "flink.public.users"; // Kalo pake debezium connect nightly
+    final static String inputTopic = "testadit.public.users"; // Kalo pake debezium 1.9
+    final static String outputTopic = "salsa";
+    //    final static String outputTopic = "salsa";
+    final static String jobTitle = "WordCount";
 
-	public static void main(String[] args) throws Exception {
-	    final String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+    private static final Logger LOG = LoggerFactory.getLogger(WordCount.class);
 
-		// Set up the streaming execution environment
-		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-
-		KafkaSource<String> source = KafkaSource.<String>builder()
-		    .setBootstrapServers(bootstrapServers)
-		    .setTopics(inputTopic)
-		    .setGroupId("my-group")
-		    .setStartingOffsets(OffsetsInitializer.earliest())
-		    .setValueOnlyDeserializer(new SimpleStringSchema())
-		    .build();
-
-		KafkaRecordSerializationSchema<String> serializer = KafkaRecordSerializationSchema.builder()
-			.setValueSerializationSchema(new SimpleStringSchema())
-			.setTopic(outputTopic)
-			.build();
-
-		KafkaSink<String> sink = KafkaSink.<String>builder()
-			.setBootstrapServers(bootstrapServers)
-			.setRecordSerializer(serializer)
-			.build();
-
-		DataStream<String> text = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Kafka Source");
-
-
-		// Split up the lines in pairs (2-tuples) containing: (word,1)
-        DataStream<String> counts = text.flatMap(new Tokenizer())
-		// Group by the tuple field "0" and sum up tuple field "1"
-		.keyBy(value -> value.f0)
-		.sum(1)
-		.flatMap(new Reducer());
-
-		// Add the sink to so results
-		// are written to the outputTopic
-        counts.sinkTo(sink);
-
-		// Execute program
-		env.execute(jobTitle);
-	}
-
-    /**
-     * Implements the string tokenizer that splits sentences into words as a user-defined
-     * FlatMapFunction. The function takes a line (String) and splits it into multiple pairs in the
-     * form of "(word,1)" ({@code Tuple2<String, Integer>}).
-     */
-    public static final class Tokenizer
-            implements FlatMapFunction<String, Tuple2<String, Integer>> {
-
-        @Override
-        public void flatMap(String value, Collector<Tuple2<String, Integer>> out) {
-            // Normalize and split the line
-            String[] tokens = value.toLowerCase().split("\\W+");
-
-            // Emit the pairs
-            for (String token : tokens) {
-                if (token.length() > 0) {
-                    out.collect(new Tuple2<>(token, 1));
-                }
-            }
+    static class SyncLog {
+        public SyncLog(String uuid, String data) {
+            this.uuid = uuid;
+            this.data = data;
         }
+
+        final String uuid;
+        final String data;
     }
 
-    // Implements a simple reducer using FlatMap to
-    // reduce the Tuple2 into a single string for 
-    // writing to kafka topics
-    public static final class Reducer
-            implements FlatMapFunction<Tuple2<String, Integer>, String> {
+    final static OutputTag<SyncLog> outputTag = new OutputTag<SyncLog>("side-output") {
+    };
 
+    public static void main(String[] args) throws Exception {
+//        final String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+
+        LOG.info("Started " + jobTitle);
+
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        KafkaSource<String> source = KafkaSource.<String>builder().setBootstrapServers("kafka:9092").setTopics(inputTopic).setStartingOffsets(OffsetsInitializer.latest()).setValueOnlyDeserializer(new SimpleStringSchema()).build();
+
+        KafkaRecordSerializationSchema<String> serializer = KafkaRecordSerializationSchema.builder().setValueSerializationSchema(new SimpleStringSchema()).setTopic(outputTopic).build();
+
+        KafkaSink<String> sink = KafkaSink.<String>builder().setBootstrapServers("kafka:9092").setRecordSerializer(serializer).build();
+
+        DataStream<String> text = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Kafka Source");
+
+//        text.sinkTo(sink);
+
+        SingleOutputStreamOperator<SyncLog> mainDataStream = text.process(new firstProcess());
+        DataStream<SyncLog> sideOutputStream = mainDataStream.getSideOutput(outputTag);
+
+        DataStreamSink<SyncLog> dd = sideOutputStream.addSink(JdbcSink.sink(
+                "insert into dadang (uuid, data) values (?, ?)",
+                (statement, syncLog) -> {
+                    statement.setString(1, syncLog.uuid);
+                    statement.setString(2, syncLog.data);
+                },
+                JdbcExecutionOptions.builder()
+                        .withBatchSize(1000)
+                        .withBatchIntervalMs(200)
+                        .withMaxRetries(5)
+                        .build(),
+                new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+                        .withUrl("jdbc:postgresql://postgresql_db:5432/sync_test_log")
+                        .withDriverName("org.postgresql.Driver")
+                        .withUsername("postgres")
+                        .withPassword("secret")
+                        .build()
+        ));
+
+
+//        DataStream<SyncLog> sideOutputStream = mainDataStream.getSideOutput(outputTag);
+//        env.fromElements(
+//                new SyncLog(UUID.randomUUID().toString(), "Stream Processing with Apache Flink")
+//        ).addSink(
+//                JdbcSink.sink(
+//                        "insert into dadang (uuid, data) values (?, ?)",
+//                        (statement, syncLog) -> {
+//                            statement.setString(1, syncLog.uuid);
+//                            statement.setString(2, syncLog.data);
+//                        },
+//                        JdbcExecutionOptions.builder()
+//                                .withBatchSize(1000)
+//                                .withBatchIntervalMs(200)
+//                                .withMaxRetries(5)
+//                                .build(),
+//                        new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+//                                .withUrl("jdbc:postgresql://postgresql_db:5432/sync_test_log")
+//                                .withDriverName("org.postgresql.Driver")
+//                                .withUsername("postgres")
+//                                .withPassword("secret")
+//                                .build()
+//                ));
+
+
+        //        KafkaSource<String> source = KafkaSource.<String>builder().setBootstrapServers("kafka:9092").setTopics(inputTopic).setStartingOffsets(OffsetsInitializer.earliest()).setValueOnlyDeserializer(new SimpleStringSchema()).build();
+//
+//        DataStream<String> stream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "MySourceName");
+//        stream.print();
+
+        env.execute(jobTitle);
+    }
+
+    public static final class firstProcess extends ProcessFunction<String, SyncLog> {
         @Override
-        public void flatMap(Tuple2<String, Integer> value, Collector<String> out) {
-        	// Convert the pairs to a string
-        	// for easy writing to Kafka Topic
-        	String count = value.f0 + " " + value.f1;
-        	out.collect(count);
+        public void processElement(String value, Context ctx, Collector<SyncLog> out) throws Exception {
+            ObjectMapper mapper = new ObjectMapper();
+
+            JsonNode root = mapper.readTree(value);
+            JsonNode payload = root.get("payload");
+            LOG.info("Pretty print");
+            LOG.info(payload.get("after").toPrettyString());
+            // emit data to regular output
+//            out.collect(String.valueOf(value));
+
+            // emit data to side output
+            ctx.output(outputTag, new SyncLog(UUID.randomUUID().toString(), "Hello World"));
+//                System.out.println("Testing " + value);
+//                LOG.info("Haha Masuk");
         }
     }
 }
